@@ -250,16 +250,31 @@ def get_last_complete_response(driver):
         print(f"Error parsing response: {e}")
     return None
 
-def wait_for_ai_to_finish(driver, timeout=60):
+def wait_for_ai_to_finish(driver, timeout=60, max_retries=3):
     """Wait for AI to finish generating response and return the complete last response"""
     start_time = time.time()
     last_complete_text = None
+    retry_count = 0
     
     while time.time() - start_time < timeout:
         try:
             # Check for loading indicators
             loading_indicators = driver.find_elements(By.CSS_SELECTOR, ".loading, .typing-indicator")
             if loading_indicators:
+                # If we've been waiting too long (more than 30 seconds) and haven't exceeded retry limit
+                if time.time() - start_time > 30 and retry_count < max_retries:
+                    print(f"\nДолгое ожидание ответа (более 30 секунд). Попытка перезагрузки {retry_count + 1}/{max_retries}...")
+                    
+                    # Try to reload the page
+                    processor = TaskProcessor(driver)
+                    if processor.reload_page():
+                        # Reset the timer and try again
+                        start_time = time.time()
+                        retry_count += 1
+                        continue
+                    else:
+                        print("Не удалось перезагрузить страницу")
+                
                 time.sleep(0.5)
                 continue
                 
@@ -273,12 +288,26 @@ def wait_for_ai_to_finish(driver, timeout=60):
                 if current_text == get_last_complete_response(driver):
                     return current_text
                     
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"Error while waiting for response: {e}")
+            # If we get an error and haven't exceeded retry limit, try reloading
+            if retry_count < max_retries:
+                print(f"\nОшибка при ожидании ответа. Попытка перезагрузки {retry_count + 1}/{max_retries}...")
+                processor = TaskProcessor(driver)
+                if processor.reload_page():
+                    start_time = time.time()
+                    retry_count += 1
+                    continue
             
         time.sleep(0.5)
     
     # If we hit timeout, try one last time to get the complete response
+    if retry_count < max_retries:
+        print("\nПревышено время ожидания. Последняя попытка перезагрузки...")
+        processor = TaskProcessor(driver)
+        if processor.reload_page():
+            return get_last_complete_response(driver)
+    
     return get_last_complete_response(driver)
 
 class TaskProcessor:
@@ -380,40 +409,21 @@ class TaskProcessor:
             print(f"Error evaluating complexity: {e}")
             return {"score": 5, "details": str(e)}
     
-    def get_solution(self, task: str, task_type: str, complexity: int) -> Dict[str, Any]:
-        """Get solution using appropriate model"""
-        available_models = self.model_mapping["solution"][task_type]
-        model_index = available_models[self.current_model_index % len(available_models)]
-        self.current_model_index += 1
-        
-        if not self.switch_model(model_index):
-            return {"draft": None, "final": "Failed to switch to solution model", "validation": {"score": 0, "errors": ["Model switch failed"]}}
-        
-        if task_type == "linear" and complexity <= 3:
-            prompt = f"Реши следующую задачу от пользователя: {task}. Требования: 1. Дай прямое и четкое решение 2. Решение должно быть полным и корректным 3. Если нужно, добавь пояснения. Ответ должен быть в формате JSON: {{'solution': 'полное решение задачи'}}"
-        else:
-            prompt = f"Реши следующую сложную задачу: Задача от пользователя: {task}. Тип: {task_type}. Сложность: {complexity}/10. Требования: 1. Сначала создай черновик решения 2. Затем дай финальное улучшенное решение. Ответ должен быть в формате JSON: {{'draft': 'черновик решения', 'solution': 'финальное улучшенное решение'}}"
+    def normalize_to_json(self, text: str, expected_format: str) -> str:
+        """Use Qwen to normalize any response to expected JSON format"""
+        if not self.switch_model(self.model_mapping["classification"]):  # Using Qwen
+            return text
+            
+        prompt = f"Ты - нормализатор ответов. Твоя задача - преобразовать любой ответ в строгий JSON формат. Исходный текст: {text}. Требуемый формат: {expected_format}. Требования: 1) Верни ТОЛЬКО JSON объект 2) Сохрани всю важную информацию из исходного текста 3) Не добавляй пояснений 4) Не используй переносы строк 5) Если в тексте нет нужной информации, используй значения по умолчанию"
         
         response = self.send_message(prompt)
         try:
-            # Try to parse the response as JSON
-            json_data = json.loads(response)
-            
-            # Convert the response to our expected format
-            result = {
-                "draft": json_data.get("draft"),
-                "final": json_data.get("solution", json_data.get("final", "No solution provided")),
-                "validation": {"score": 0, "errors": []}  # Empty validation, will be filled by validator
-            }
-            return result
-            
-        except json.JSONDecodeError as e:
-            print(f"Error parsing solution response: {e}")
-            return {"draft": None, "final": f"Error: Invalid JSON response", "validation": {"score": 0, "errors": ["Invalid JSON format"]}}
-        except Exception as e:
-            print(f"Error getting solution: {e}")
-            return {"draft": None, "final": f"Error: {str(e)}", "validation": {"score": 0, "errors": [str(e)]}}
-    
+            # Try to parse as JSON to validate
+            json.loads(response)
+            return response
+        except:
+            return text
+
     def validate_solution(self, task: str, task_type_reason: str, solution: str) -> Dict[str, Any]:
         """Validate solution using Claude"""
         if not self.switch_model(self.model_mapping["validation"]):
@@ -432,14 +442,57 @@ class TaskProcessor:
         prompt = f"Ты - валидатор решений. Твоя задача - строго оценить решение в формате JSON. Задача: {task}. Тип задачи: {task_type_reason}. Решение для проверки: {solution}. Требования: 1) Верни ТОЛЬКО JSON объект в формате {{'score': число от 0 до 10, 'errors': ['список ошибок или пустой массив']}} 2) score: 0=полностью неверно, 5=частично верно, 10=идеально 3) errors: массив строк с описанием ошибок или пустой массив если ошибок нет 4) Не добавляй никаких пояснений до или после JSON 5) Не используй переносы строк в JSON"
         
         response = self.send_message(prompt)
+        
+        # Normalize response using Qwen
+        expected_format = "{'score': число от 0 до 10, 'errors': ['список ошибок или пустой массив']}"
+        normalized_response = self.normalize_to_json(response, expected_format)
+        
         try:
-            json_str = re.search(r'\{[\s\S]*\}', response)
-            if not json_str:
-                return {"score": 0, "errors": ["Failed to find JSON in response"]}
-            return json.loads(json_str.group(0))
+            return json.loads(normalized_response)
+        except json.JSONDecodeError as e:
+            print(f"Error parsing normalized response: {e}")
+            return {"score": 0, "errors": ["Failed to parse validation response"]}
         except Exception as e:
-            print(f"Error validating solution: {e}")
+            print(f"Error in validation: {e}")
             return {"score": 0, "errors": [str(e)]}
+    
+    def get_solution(self, task: str, task_type: str, complexity: int) -> Dict[str, Any]:
+        """Get solution using appropriate model"""
+        available_models = self.model_mapping["solution"][task_type]
+        model_index = available_models[self.current_model_index % len(available_models)]
+        self.current_model_index += 1
+        
+        if not self.switch_model(model_index):
+            return {"draft": None, "final": "Failed to switch to solution model", "validation": {"score": 0, "errors": ["Model switch failed"]}}
+        
+        if task_type == "linear" and complexity <= 3:
+            prompt = f"Реши следующую задачу от пользователя: {task}. Требования: 1. Дай прямое и четкое решение 2. Решение должно быть полным и корректным 3. Если нужно, добавь пояснения. Ответ должен быть в формате JSON: {{'solution': 'полное решение задачи'}}"
+        else:
+            prompt = f"Реши следующую сложную задачу: Задача от пользователя: {task}. Тип: {task_type}. Сложность: {complexity}/10. Требования: 1. Сначала создай черновик решения 2. Затем дай финальное улучшенное решение. Ответ должен быть в формате JSON: {{'draft': 'черновик решения', 'solution': 'финальное улучшенное решение'}}"
+        
+        response = self.send_message(prompt)
+        
+        # Normalize response using Qwen
+        expected_format = "{'draft': 'черновик решения', 'solution': 'финальное решение'}" if task_type != "linear" else "{'solution': 'полное решение задачи'}"
+        normalized_response = self.normalize_to_json(response, expected_format)
+        
+        try:
+            json_data = json.loads(normalized_response)
+            
+            # Convert the response to our expected format
+            result = {
+                "draft": json_data.get("draft"),
+                "final": json_data.get("solution", json_data.get("final", "No solution provided")),
+                "validation": {"score": 0, "errors": []}  # Empty validation, will be filled by validator
+            }
+            return result
+            
+        except json.JSONDecodeError as e:
+            print(f"Error parsing solution response: {e}")
+            return {"draft": None, "final": f"Error: Invalid JSON response", "validation": {"score": 0, "errors": ["Invalid JSON format"]}}
+        except Exception as e:
+            print(f"Error getting solution: {e}")
+            return {"draft": None, "final": f"Error: {str(e)}", "validation": {"score": 0, "errors": [str(e)]}}
     
     def process_task(self, task: str) -> Dict[str, Any]:
         """Process a task through multiple specialized models"""
@@ -544,89 +597,119 @@ class TaskProcessor:
     
     def send_message(self, message: str) -> str:
         """Send message to AI and get response"""
+        max_retries = 3
+        retry_count = 0
+        
+        while retry_count < max_retries:
+            try:
+                # Find the textarea for input
+                textarea = WebDriverWait(self.driver, 10).until(
+                    EC.presence_of_element_located((By.CSS_SELECTOR, "textarea#message"))
+                )
+                
+                # Clear and send message
+                textarea.clear()
+                textarea.send_keys(message)
+                
+                time.sleep(2)  # Add small delay before clicking
+                
+                # Find send button by the image inside it
+                try:
+                    # First try to find the image
+                    send_img = WebDriverWait(self.driver, 20).until(
+                        EC.presence_of_element_located((By.CSS_SELECTOR, "img[src*='sendbutton.png']"))
+                    )
+                    # Get the button parent
+                    send_button = send_img.find_element(By.XPATH, "./..")
+                    
+                    # Try multiple click methods
+                    try:
+                        # Method 1: Regular click
+                        send_button.click()
+                    except:
+                        try:
+                            # Method 2: JavaScript click
+                            self.driver.execute_script("arguments[0].click();", send_button)
+                        except:
+                            # Method 3: Actions click
+                            from selenium.webdriver.common.action_chains import ActionChains
+                            ActionChains(self.driver).move_to_element(send_button).click().perform()
+                
+                    time.sleep(2)  # Small delay to ensure click is processed
+                    
+                except Exception as e:
+                    print(f"Error with send button: {str(e)}")
+                    # Fallback to Enter key if button click fails
+                    print("Falling back to Enter key...")
+                    textarea.send_keys(Keys.RETURN)
+                
+                # Wait for response to start appearing with increased timeout
+                try:
+                    WebDriverWait(self.driver, 20).until(
+                        EC.presence_of_element_located((By.CSS_SELECTOR, "div.response"))
+                    )
+                except:
+                    print("Response div not found, checking if message was sent...")
+                    # Check if the message appears in chat
+                    WebDriverWait(self.driver, 20).until(
+                        EC.presence_of_element_located((By.CSS_SELECTOR, "div.chatbot-message"))
+                    )
+                
+                # Wait for AI to finish generating the response
+                response = wait_for_ai_to_finish(self.driver)
+                
+                if response:  # If we got a response, return it
+                    return response
+                    
+                # If no response, try reloading
+                print(f"\nНет ответа. Попытка перезагрузки {retry_count + 1}/{max_retries}...")
+                if self.reload_page():
+                    retry_count += 1
+                    continue
+                else:
+                    print("Не удалось перезагрузить страницу")
+                    break
+                    
+            except Exception as e:
+                print(f"Error sending message: {e}")
+                if retry_count < max_retries:
+                    print(f"\nОшибка при отправке сообщения. Попытка перезагрузки {retry_count + 1}/{max_retries}...")
+                    if self.reload_page():
+                        retry_count += 1
+                        continue
+                break
+        
+        return ""  # Return empty string if all retries failed
+
+    def reload_page(self):
+        """Reload the current page and wait for it to be ready"""
         try:
-            # Find the textarea for input
-            textarea = WebDriverWait(self.driver, 10).until(
+            # Save current URL
+            current_url = self.driver.current_url
+            
+            # Reload the page
+            self.driver.refresh()
+            
+            # Wait for page to be fully loaded and interactive
+            WebDriverWait(self.driver, 10).until(
                 EC.presence_of_element_located((By.CSS_SELECTOR, "textarea#message"))
             )
+            WebDriverWait(self.driver, 10).until(
+                EC.element_to_be_clickable((By.CSS_SELECTOR, "textarea#message"))
+            )
             
-            # Clear and send message
-            textarea.clear()
-            textarea.send_keys(message)
+            # Additional wait to ensure all JavaScript is loaded
+            time.sleep(2)
             
-            time.sleep(2)  # Add small delay before clicking
-            
-            # Find send button by the image inside it
-            try:
-                # First try to find the image
-                send_img = WebDriverWait(self.driver, 20).until(
-                    EC.presence_of_element_located((By.CSS_SELECTOR, "img[src*='sendbutton.png']"))
-                )
-                # Get the button parent
-                send_button = send_img.find_element(By.XPATH, "./..")
+            # Verify we can interact with the page
+            textarea = self.driver.find_element(By.CSS_SELECTOR, "textarea#message")
+            if not textarea.is_enabled():
+                raise Exception("Textarea is not enabled after reload")
                 
-                # Try multiple click methods
-                try:
-                    # Method 1: Regular click
-                    send_button.click()
-                except:
-                    try:
-                        # Method 2: JavaScript click
-                        self.driver.execute_script("arguments[0].click();", send_button)
-                    except:
-                        # Method 3: Actions click
-                        from selenium.webdriver.common.action_chains import ActionChains
-                        ActionChains(self.driver).move_to_element(send_button).click().perform()
-                
-                time.sleep(2)  # Small delay to ensure click is processed
-                
-            except Exception as e:
-                print(f"Error with send button: {str(e)}")
-                # Fallback to Enter key if button click fails
-                print("Falling back to Enter key...")
-                textarea.send_keys(Keys.RETURN)
-            
-            # Wait for response to start appearing with increased timeout
-            try:
-                WebDriverWait(self.driver, 20).until(
-                    EC.presence_of_element_located((By.CSS_SELECTOR, "div.response"))
-                )
-            except:
-                print("Response div not found, checking if message was sent...")
-                # Check if the message appears in chat
-                WebDriverWait(self.driver, 20).until(
-                    EC.presence_of_element_located((By.CSS_SELECTOR, "div.chatbot-message"))
-                )
-            
-            # Wait for AI to finish generating the response
-            response = wait_for_ai_to_finish(self.driver)
-            
-            # Process the response
-            if response:
-                try:
-                    # Try to find JSON in the response
-                    start_idx = response.find('{')
-                    end_idx = response.rfind('}') + 1
-                    
-                    if start_idx != -1 and end_idx != -1:
-                        json_text = response[start_idx:end_idx]
-                        try:
-                            json_data = json.loads(json_text)
-                            return json.dumps(json_data, ensure_ascii=False, indent=2)
-                        except json.JSONDecodeError:
-                            # If JSON parsing fails, return the original response
-                            return response
-                    else:
-                        # If no JSON found, return the original response
-                        return response
-                except Exception as e:
-                    print(f"Error processing response: {e}")
-                    return response
-            return ""
-            
+            return True
         except Exception as e:
-            print(f"Error sending message: {e}")
-            return ""
+            print(f"Error reloading page: {e}")
+            return False
 
 def main():
     try:
