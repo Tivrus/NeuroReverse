@@ -169,18 +169,28 @@ def get_last_complete_response(driver):
         json_code = response_div.find('code', class_='language-json')
         if json_code:
             try:
-                # Extract JSON text and parse it
+                # Get the text content and clean it
                 json_text = json_code.get_text()
-                # Clean up the text (remove any non-JSON content)
-                json_text = re.sub(r'[^\x00-\x7F]+', '', json_text)  # Remove non-ASCII
-                json_text = re.sub(r'\s+', ' ', json_text).strip()  # Normalize whitespace
-                # Try to parse JSON
-                try:
-                    json_data = json.loads(json_text)
-                    return json.dumps(json_data, ensure_ascii=False, indent=2)
-                except json.JSONDecodeError:
-                    # If JSON parsing fails, return the raw text
+                
+                # Find the actual JSON content
+                start_idx = json_text.find('{')
+                end_idx = json_text.rfind('}') + 1
+                
+                if start_idx != -1 and end_idx != -1:
+                    json_text = json_text[start_idx:end_idx]
+                    
+                    # Try to parse JSON
+                    try:
+                        json_data = json.loads(json_text)
+                        return json.dumps(json_data, ensure_ascii=False, indent=2)
+                    except json.JSONDecodeError as e:
+                        print(f"JSON decode error: {e}")
+                        print(f"Problematic JSON text: {json_text}")
+                        return json_text
+                else:
+                    print("No JSON object found in response")
                     return json_text
+                    
             except Exception as e:
                 print(f"Error parsing JSON response: {e}")
                 return json_code.get_text()
@@ -353,12 +363,12 @@ class TaskProcessor:
             print(f"Error classifying task: {e}")
             return {"type": "unknown", "reason": str(e)}
     
-    def evaluate_complexity(self, task: str, task_type: str) -> Dict[str, Any]:
+    def evaluate_complexity(self, task: str, task_type: str, task_type_reason: str) -> Dict[str, Any]:
         """Evaluate task complexity using DeepSeek"""
         if not self.switch_model(self.model_mapping["complexity"]):
             return {"score": 5, "details": "Failed to switch to complexity evaluation model"}
             
-        prompt = f"Оцени сложность следующей задачи: Задача от пользователя: {task}. {'Задача является прямолинейной и логичной, не абстрактной. ' if task_type == 'linear' else 'Задача является абстрактной, имеет больше одного решения. '} Оцени сложность реализации по шкале от 0 до 10, где: 0 - очень простая задача, 5 - задача средней сложности, 10 - очень сложная задача. Ответ должен быть в формате JSON: {{'score': число от 0 до 10, 'details': 'подробное объяснение оценки сложности'}}. Важно: 1. Ответ только в формате JSON 2. Объяснение должно быть на русском языке 3. Учитывай тип задачи при оценке"
+        prompt = f"Оцени сложность следующей задачи от пользователя: {task}. {(str(task_type_reason)+' Задача является прямолинейной и логичной, не абстрактной. ') if task_type == 'linear' else 'Задача является абстрактной, имеет больше одного решения. '} Оцени сложность реализации по шкале от 0 до 10, где: 0 - очень простая задача, 5 - задача средней сложности, 10 - очень сложная задача. Ответ должен быть в формате JSON: {{'score': число от 0 до 10, 'details': 'подробное объяснение оценки сложности'}}. Важно: 1. Ответ только в формате JSON 2. Объяснение должно быть на русском языке 3. Учитывай тип задачи при оценке"
         
         response = self.send_message(prompt)
         try:
@@ -380,35 +390,46 @@ class TaskProcessor:
             return {"draft": None, "final": "Failed to switch to solution model", "validation": {"score": 0, "errors": ["Model switch failed"]}}
         
         if task_type == "linear" and complexity <= 3:
-            prompt = f"Реши следующую задачу: Задача от пользователя: {task}. Требования: 1. Дай прямое и четкое решение 2. Решение должно быть полным и корректным 3. Если нужно, добавь пояснения. Ответ должен быть в формате JSON: {{'solution': 'полное решение задачи'}}"
+            prompt = f"Реши следующую задачу от пользователя: {task}. Требования: 1. Дай прямое и четкое решение 2. Решение должно быть полным и корректным 3. Если нужно, добавь пояснения. Ответ должен быть в формате JSON: {{'solution': 'полное решение задачи'}}"
         else:
             prompt = f"Реши следующую сложную задачу: Задача от пользователя: {task}. Тип: {task_type}. Сложность: {complexity}/10. Требования: 1. Сначала создай черновик решения 2. Затем дай финальное улучшенное решение. Ответ должен быть в формате JSON: {{'draft': 'черновик решения', 'solution': 'финальное улучшенное решение'}}"
         
         response = self.send_message(prompt)
         try:
-            json_str = re.search(r'\{[\s\S]*\}', response)
-            if not json_str:
-                return {"draft": None, "solution": "Failed to find JSON in response", "validation": {"score": 0, "errors": ["JSON not found"]}}
-            solution_data = json.loads(json_str.group(0))
+            # Try to parse the response as JSON
+            json_data = json.loads(response)
             
             # Convert the response to our expected format
             result = {
-                "draft": solution_data.get("draft"),
-                "final": solution_data.get("solution", solution_data.get("final", "No solution provided")),
+                "draft": json_data.get("draft"),
+                "final": json_data.get("solution", json_data.get("final", "No solution provided")),
                 "validation": {"score": 0, "errors": []}  # Empty validation, will be filled by validator
             }
             return result
             
+        except json.JSONDecodeError as e:
+            print(f"Error parsing solution response: {e}")
+            return {"draft": None, "final": f"Error: Invalid JSON response", "validation": {"score": 0, "errors": ["Invalid JSON format"]}}
         except Exception as e:
             print(f"Error getting solution: {e}")
             return {"draft": None, "final": f"Error: {str(e)}", "validation": {"score": 0, "errors": [str(e)]}}
     
-    def validate_solution(self, task: str, solution: str) -> Dict[str, Any]:
+    def validate_solution(self, task: str, task_type_reason: str, solution: str) -> Dict[str, Any]:
         """Validate solution using Claude"""
         if not self.switch_model(self.model_mapping["validation"]):
             return {"score": 0, "errors": ["Failed to switch to validation model"]}
+        
+        # Preprocess input data to ensure single line
+        task = task.replace('\n', ' ').strip()
+        task_type_reason = task_type_reason.replace('\n', ' ').strip()
+        solution = solution.replace('\n', ' ').strip()
+        
+        # Remove multiple spaces
+        task = ' '.join(task.split())
+        task_type_reason = ' '.join(task_type_reason.split())
+        solution = ' '.join(solution.split())
             
-        prompt = f"Проверь корректность решения: Задача от пользователя: {task}. Решение: {solution}. Требования к валидации: 1. Оцени качество решения по шкале от 0 до 10 2. Укажи все найденные ошибки или недостатки 3. Если решение идеально, укажи пустой массив ошибок. Ответ должен быть в формате JSON: {{'score': число от 0 до 10, 'errors': ['список ошибок или пустой массив']}}"
+        prompt = f"Ты - валидатор решений. Твоя задача - строго оценить решение в формате JSON. Задача: {task}. Тип задачи: {task_type_reason}. Решение для проверки: {solution}. Требования: 1) Верни ТОЛЬКО JSON объект в формате {{'score': число от 0 до 10, 'errors': ['список ошибок или пустой массив']}} 2) score: 0=полностью неверно, 5=частично верно, 10=идеально 3) errors: массив строк с описанием ошибок или пустой массив если ошибок нет 4) Не добавляй никаких пояснений до или после JSON 5) Не используй переносы строк в JSON"
         
         response = self.send_message(prompt)
         try:
@@ -438,13 +459,14 @@ class TaskProcessor:
         classification = self.classify_task(task)
         task_record["classification"] = classification
         task_type = classification["type"]
+        task_type_reason = classification['reason']
         print(f"Тип задачи: {classification['type']}")
         print(f"Объяснение: {classification['reason']}")
         
         # Step 2: Complexity evaluation using DeepSeek
         print("\n[Шаг 2] Оценка сложности (DeepSeek)")
         print("-"*30)
-        complexity = self.evaluate_complexity(task, task_type)
+        complexity = self.evaluate_complexity(task, task_type, task_type_reason)
         task_record["complexity"] = complexity
         print(f"Оценка сложности: {complexity['score']}/10")
         print(f"Объяснение: {complexity['details']}")
@@ -464,7 +486,7 @@ class TaskProcessor:
         # Step 4: Validate solution using Claude
         print("\n[Шаг 4] Валидация решения (Claude)")
         print("-"*30)
-        validation = self.validate_solution(task, solution["final"])
+        validation = self.validate_solution(task, task_type_reason, solution["final"])
         print(f"Оценка качества: {validation['score']}/10")
         if validation["errors"]:
             print("\nНайденные ошибки:")
@@ -475,7 +497,7 @@ class TaskProcessor:
         if validation["score"] < 8:
             print(f"\nНизкая оценка качества ({validation['score']}), пробуем другую модель...")
             solution = self.get_solution(task, task_type, complexity["score"])
-            validation = self.validate_solution(task, solution["final"])
+            validation = self.validate_solution(task, task_type_reason,solution["final"])
             current_model = URLS[self.model_mapping["solution"][task_type][self.current_model_index % 2]].split('/')[-2]
             print(f"\nНовое решение от {current_model}:")
             if solution.get("draft"):
@@ -532,7 +554,7 @@ class TaskProcessor:
             textarea.clear()
             textarea.send_keys(message)
             
-            time.sleep(4)  # Add small delay before clicking
+            time.sleep(2)  # Add small delay before clicking
             
             # Find send button by the image inside it
             try:
@@ -542,6 +564,7 @@ class TaskProcessor:
                 )
                 # Get the button parent
                 send_button = send_img.find_element(By.XPATH, "./..")
+                
                 # Try multiple click methods
                 try:
                     # Method 1: Regular click
@@ -576,7 +599,30 @@ class TaskProcessor:
                 )
             
             # Wait for AI to finish generating the response
-            return wait_for_ai_to_finish(self.driver)
+            response = wait_for_ai_to_finish(self.driver)
+            
+            # Process the response
+            if response:
+                try:
+                    # Try to find JSON in the response
+                    start_idx = response.find('{')
+                    end_idx = response.rfind('}') + 1
+                    
+                    if start_idx != -1 and end_idx != -1:
+                        json_text = response[start_idx:end_idx]
+                        try:
+                            json_data = json.loads(json_text)
+                            return json.dumps(json_data, ensure_ascii=False, indent=2)
+                        except json.JSONDecodeError:
+                            # If JSON parsing fails, return the original response
+                            return response
+                    else:
+                        # If no JSON found, return the original response
+                        return response
+                except Exception as e:
+                    print(f"Error processing response: {e}")
+                    return response
+            return ""
             
         except Exception as e:
             print(f"Error sending message: {e}")
