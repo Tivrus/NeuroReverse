@@ -1,0 +1,23 @@
+[
+  {
+    "task": "Итак, придумай несложное уравнение и реши его",
+    "iterations": [
+      {
+        "response": " 2x + 3 = 11 : 2x = 8, x = 4.",
+        "validation": {
+          "score": 10,
+          "errors": []
+        },
+        "model": "deepseek"
+      }
+    ],
+    "classification": {
+      "type": "linear",
+      "reason": " , . 'linear', ."
+    },
+    "complexity": {
+      "score": 1,
+      "details": " , . ."
+    }
+  }
+]

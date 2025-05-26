@@ -16,6 +16,11 @@ from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from bs4 import BeautifulSoup
 import time
+import json
+import datetime
+from typing import Dict, Any, Optional, List
+import re
+
 # URLs for different AI chat interfaces
 URLS = [
     "https://minitoolai.com/chatGPT/",
@@ -159,7 +164,30 @@ def get_last_complete_response(driver):
         response_div = last_message.find('div', class_='response')
         if not response_div:
             return None
-            
+
+        # Check if response is JSON
+        json_code = response_div.find('code', class_='language-json')
+        if json_code:
+            try:
+                # Extract JSON text and parse it
+                json_text = json_code.get_text()
+                # Clean up the text (remove any non-JSON content)
+                json_text = re.sub(r'[^\x00-\x7F]+', '', json_text)  # Remove non-ASCII
+                json_text = re.sub(r'\s+', ' ', json_text).strip()  # Normalize whitespace
+                # Try to parse JSON
+                try:
+                    json_data = json.loads(json_text)
+                    return json.dumps(json_data, ensure_ascii=False, indent=2)
+                except json.JSONDecodeError:
+                    # If JSON parsing fails, return the raw text
+                    return json_text
+            except Exception as e:
+                print(f"Error parsing JSON response: {e}")
+                return json_code.get_text()
+
+        # If not JSON, process as regular text with math
+        full_text = []
+        
         # First, find all math elements and their positions
         math_elements = []
         for elem in response_div.find_all(['mjx-container', 'math']):
@@ -175,9 +203,6 @@ def get_last_complete_response(driver):
                         'text': text,
                         'element': elem
                     })
-        
-        # Process all content
-        full_text = []
         
         # Process lists first
         for list_elem in response_div.find_all(['ol', 'ul']):
@@ -246,72 +271,363 @@ def wait_for_ai_to_finish(driver, timeout=60):
     # If we hit timeout, try one last time to get the complete response
     return get_last_complete_response(driver)
 
-def send_message(driver, message):
-    try:
-        # Find the textarea for input
-        textarea = WebDriverWait(driver, 10).until(
-            EC.presence_of_element_located((By.CSS_SELECTOR, "textarea#message"))
-        )
+class TaskProcessor:
+    def __init__(self, driver):
+        self.driver = driver
+        self.history: List[Dict[str, Any]] = []
+        self.current_task: Optional[Dict[str, Any]] = None
+        self.current_model_index = 0
         
-        # Clear and send message
-        textarea.clear()
-        textarea.send_keys(message)
-        textarea.send_keys(Keys.RETURN)
+        # Model mapping for different task types
+        self.model_mapping = {
+            "classification": 2,     # Qwen for initial classification
+            "complexity": 1,         # DeepSeek for complexity evaluation
+            "solution": {            # Different models for solution
+                "linear": [0, 1],    # ChatGPT, DeepSeek for linear tasks
+                "abstract": [3, 4]   # Claude, Gemini for creative tasks
+            },
+            "validation": 3          # Claude for validation
+        }
+    
+    def switch_model(self, model_index: int):
+        """Switch to a different AI model"""
+        try:
+            # Clear any existing chat history first
+            try:
+                clear_button = self.driver.find_element(By.CSS_SELECTOR, "button.clear-chat")
+                if clear_button:
+                    clear_button.click()
+                    time.sleep(1)
+            except:
+                pass  # Ignore if clear button not found
+            
+            # Navigate to new model
+            self.driver.get(URLS[model_index])
+            
+            # Wait for initial load and clear any existing state
+            WebDriverWait(self.driver, 10).until(
+                EC.presence_of_element_located((By.CSS_SELECTOR, "textarea#message"))
+            )
+            
+            # Clear browser cache and cookies for this domain
+            self.driver.delete_all_cookies()
+            
+            # Refresh the page to ensure clean state
+            self.driver.refresh()
+            
+            # Wait for page to be fully loaded and interactive
+            WebDriverWait(self.driver, 10).until(
+                EC.presence_of_element_located((By.CSS_SELECTOR, "textarea#message"))
+            )
+            WebDriverWait(self.driver, 10).until(
+                EC.element_to_be_clickable((By.CSS_SELECTOR, "textarea#message"))
+            )
+            
+            # Additional wait to ensure all JavaScript is loaded
+            time.sleep(2)
+            
+            # Verify we can interact with the page
+            textarea = self.driver.find_element(By.CSS_SELECTOR, "textarea#message")
+            if not textarea.is_enabled():
+                raise Exception("Textarea is not enabled after page load")
+                
+            return True
+        except Exception as e:
+            print(f"Error switching model: {e}")
+            return False
+    
+    def classify_task(self, task: str) -> Dict[str, Any]:
+        """Classify task using Qwen"""
+        if not self.switch_model(self.model_mapping["classification"]):
+            return {"type": "unknown", "reason": "Failed to switch to classification model"}
+            
+        prompt = f"Проанализируй следующую задачу и определи её тип: Задача от пользователя: {task}. Определи, к какому типу относится задача: 1. 'linear' - конкретная задача с одним четким решением, 2. 'abstract' - творческая задача с множеством возможных решений. Ответ должен быть в формате JSON: {{'type': 'linear или abstract', 'reason': 'подробное объяснение, почему задача относится к этому типу'}}. Важно: 1. Ответ только в формате JSON 2. Объяснение должно быть на русском языке 3. Учитывай все аспекты задачи"
         
-        # Wait for response to start appearing
-        WebDriverWait(driver, 10).until(
-            EC.presence_of_element_located((By.CSS_SELECTOR, "div.response"))
-        )
+        response = self.send_message(prompt)
+        try:
+            json_str = re.search(r'\{[\s\S]*\}', response)
+            if not json_str:
+                return {"type": "unknown", "reason": "Failed to find JSON in response"}
+            return json.loads(json_str.group(0))
+        except Exception as e:
+            print(f"Error classifying task: {e}")
+            return {"type": "unknown", "reason": str(e)}
+    
+    def evaluate_complexity(self, task: str, task_type: str) -> Dict[str, Any]:
+        """Evaluate task complexity using DeepSeek"""
+        if not self.switch_model(self.model_mapping["complexity"]):
+            return {"score": 5, "details": "Failed to switch to complexity evaluation model"}
+            
+        prompt = f"Оцени сложность следующей задачи: Задача от пользователя: {task}. {'Задача является прямолинейной и логичной, не абстрактной. ' if task_type == 'linear' else 'Задача является абстрактной, имеет больше одного решения. '} Оцени сложность реализации по шкале от 0 до 10, где: 0 - очень простая задача, 5 - задача средней сложности, 10 - очень сложная задача. Ответ должен быть в формате JSON: {{'score': число от 0 до 10, 'details': 'подробное объяснение оценки сложности'}}. Важно: 1. Ответ только в формате JSON 2. Объяснение должно быть на русском языке 3. Учитывай тип задачи при оценке"
         
-        # Wait for AI to finish generating the response
-        response_text = wait_for_ai_to_finish(driver)
-        return response_text
+        response = self.send_message(prompt)
+        try:
+            json_str = re.search(r'\{[\s\S]*\}', response)
+            if not json_str:
+                return {"score": 5, "details": "Failed to find JSON in response"}
+            return json.loads(json_str.group(0))
+        except Exception as e:
+            print(f"Error evaluating complexity: {e}")
+            return {"score": 5, "details": str(e)}
+    
+    def get_solution(self, task: str, task_type: str, complexity: int) -> Dict[str, Any]:
+        """Get solution using appropriate model"""
+        available_models = self.model_mapping["solution"][task_type]
+        model_index = available_models[self.current_model_index % len(available_models)]
+        self.current_model_index += 1
         
-    except Exception as e:
-        print(f"Error sending message: {e}")
-        return None
+        if not self.switch_model(model_index):
+            return {"draft": None, "final": "Failed to switch to solution model", "validation": {"score": 0, "errors": ["Model switch failed"]}}
+        
+        if task_type == "linear" and complexity <= 3:
+            prompt = f"Реши следующую задачу: Задача от пользователя: {task}. Требования: 1. Дай прямое и четкое решение 2. Решение должно быть полным и корректным 3. Если нужно, добавь пояснения. Ответ должен быть в формате JSON: {{'solution': 'полное решение задачи'}}"
+        else:
+            prompt = f"Реши следующую сложную задачу: Задача от пользователя: {task}. Тип: {task_type}. Сложность: {complexity}/10. Требования: 1. Сначала создай черновик решения 2. Затем дай финальное улучшенное решение. Ответ должен быть в формате JSON: {{'draft': 'черновик решения', 'solution': 'финальное улучшенное решение'}}"
+        
+        response = self.send_message(prompt)
+        try:
+            json_str = re.search(r'\{[\s\S]*\}', response)
+            if not json_str:
+                return {"draft": None, "solution": "Failed to find JSON in response", "validation": {"score": 0, "errors": ["JSON not found"]}}
+            solution_data = json.loads(json_str.group(0))
+            
+            # Convert the response to our expected format
+            result = {
+                "draft": solution_data.get("draft"),
+                "final": solution_data.get("solution", solution_data.get("final", "No solution provided")),
+                "validation": {"score": 0, "errors": []}  # Empty validation, will be filled by validator
+            }
+            return result
+            
+        except Exception as e:
+            print(f"Error getting solution: {e}")
+            return {"draft": None, "final": f"Error: {str(e)}", "validation": {"score": 0, "errors": [str(e)]}}
+    
+    def validate_solution(self, task: str, solution: str) -> Dict[str, Any]:
+        """Validate solution using Claude"""
+        if not self.switch_model(self.model_mapping["validation"]):
+            return {"score": 0, "errors": ["Failed to switch to validation model"]}
+            
+        prompt = f"Проверь корректность решения: Задача от пользователя: {task}. Решение: {solution}. Требования к валидации: 1. Оцени качество решения по шкале от 0 до 10 2. Укажи все найденные ошибки или недостатки 3. Если решение идеально, укажи пустой массив ошибок. Ответ должен быть в формате JSON: {{'score': число от 0 до 10, 'errors': ['список ошибок или пустой массив']}}"
+        
+        response = self.send_message(prompt)
+        try:
+            json_str = re.search(r'\{[\s\S]*\}', response)
+            if not json_str:
+                return {"score": 0, "errors": ["Failed to find JSON in response"]}
+            return json.loads(json_str.group(0))
+        except Exception as e:
+            print(f"Error validating solution: {e}")
+            return {"score": 0, "errors": [str(e)]}
+    
+    def process_task(self, task: str) -> Dict[str, Any]:
+        """Process a task through multiple specialized models"""
+        print("\n" + "="*50)
+        print("Начинаем обработку задачи...")
+        print("="*50)
+        
+        # Initialize task record
+        task_record = {
+            "task": task,
+            "iterations": []
+        }
+        
+        # Step 1: Classification using Qwen
+        print("\n[Шаг 1] Классификация задачи (Qwen)")
+        print("-"*30)
+        classification = self.classify_task(task)
+        task_record["classification"] = classification
+        task_type = classification["type"]
+        print(f"Тип задачи: {classification['type']}")
+        print(f"Объяснение: {classification['reason']}")
+        
+        # Step 2: Complexity evaluation using DeepSeek
+        print("\n[Шаг 2] Оценка сложности (DeepSeek)")
+        print("-"*30)
+        complexity = self.evaluate_complexity(task, task_type)
+        task_record["complexity"] = complexity
+        print(f"Оценка сложности: {complexity['score']}/10")
+        print(f"Объяснение: {complexity['details']}")
+        
+        # Step 3: Get solution using appropriate model
+        print("\n[Шаг 3] Получение решения")
+        print("-"*30)
+        solution = self.get_solution(task, task_type, complexity["score"])
+        current_model = URLS[self.model_mapping["solution"][task_type][self.current_model_index % 2]].split('/')[-2]
+        print(f"Модель: {current_model}")
+        if solution.get("draft"):
+            print("\nЧерновик решения:")
+            print(solution["draft"])
+        print("\nФинальное решение:")
+        print(solution["final"])
+        
+        # Step 4: Validate solution using Claude
+        print("\n[Шаг 4] Валидация решения (Claude)")
+        print("-"*30)
+        validation = self.validate_solution(task, solution["final"])
+        print(f"Оценка качества: {validation['score']}/10")
+        if validation["errors"]:
+            print("\nНайденные ошибки:")
+            for error in validation["errors"]:
+                print(f"- {error}")
+        
+        # If validation score is low, try with different model
+        if validation["score"] < 8:
+            print(f"\nНизкая оценка качества ({validation['score']}), пробуем другую модель...")
+            solution = self.get_solution(task, task_type, complexity["score"])
+            validation = self.validate_solution(task, solution["final"])
+            current_model = URLS[self.model_mapping["solution"][task_type][self.current_model_index % 2]].split('/')[-2]
+            print(f"\nНовое решение от {current_model}:")
+            if solution.get("draft"):
+                print("\nЧерновик решения:")
+                print(solution["draft"])
+            print("\nФинальное решение:")
+            print(solution["final"])
+            print(f"\nНовая оценка качества: {validation['score']}/10")
+            if validation["errors"]:
+                print("\nНайденные ошибки:")
+                for error in validation["errors"]:
+                    print(f"- {error}")
+        
+        # Save solution
+        iteration = {
+            "response": solution["final"],
+            "validation": validation,
+            "model": current_model
+        }
+        
+        if solution.get("draft"):
+            task_record["draft"] = solution["draft"]
+        
+        task_record["iterations"].append(iteration)
+        
+        # Save to history
+        self.history.append(task_record)
+        self.current_task = task_record
+        self.save_history()
+        
+        print("\n" + "="*50)
+        print("Обработка задачи завершена")
+        print("="*50 + "\n")
+        
+        return task_record
+    
+    def save_history(self):
+        """Save processing history to file"""
+        try:
+            with open('task_history.json', 'w', encoding='utf-8') as f:
+                json.dump(self.history, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            print(f"Error saving history: {e}")
+    
+    def send_message(self, message: str) -> str:
+        """Send message to AI and get response"""
+        try:
+            # Find the textarea for input
+            textarea = WebDriverWait(self.driver, 10).until(
+                EC.presence_of_element_located((By.CSS_SELECTOR, "textarea#message"))
+            )
+            
+            # Clear and send message
+            textarea.clear()
+            textarea.send_keys(message)
+            
+            time.sleep(4)  # Add small delay before clicking
+            
+            # Find send button by the image inside it
+            try:
+                # First try to find the image
+                send_img = WebDriverWait(self.driver, 20).until(
+                    EC.presence_of_element_located((By.CSS_SELECTOR, "img[src*='sendbutton.png']"))
+                )
+                # Get the button parent
+                send_button = send_img.find_element(By.XPATH, "./..")
+                # Try multiple click methods
+                try:
+                    # Method 1: Regular click
+                    send_button.click()
+                except:
+                    try:
+                        # Method 2: JavaScript click
+                        self.driver.execute_script("arguments[0].click();", send_button)
+                    except:
+                        # Method 3: Actions click
+                        from selenium.webdriver.common.action_chains import ActionChains
+                        ActionChains(self.driver).move_to_element(send_button).click().perform()
+                
+                time.sleep(2)  # Small delay to ensure click is processed
+                
+            except Exception as e:
+                print(f"Error with send button: {str(e)}")
+                # Fallback to Enter key if button click fails
+                print("Falling back to Enter key...")
+                textarea.send_keys(Keys.RETURN)
+            
+            # Wait for response to start appearing with increased timeout
+            try:
+                WebDriverWait(self.driver, 20).until(
+                    EC.presence_of_element_located((By.CSS_SELECTOR, "div.response"))
+                )
+            except:
+                print("Response div not found, checking if message was sent...")
+                # Check if the message appears in chat
+                WebDriverWait(self.driver, 20).until(
+                    EC.presence_of_element_located((By.CSS_SELECTOR, "div.chatbot-message"))
+                )
+            
+            # Wait for AI to finish generating the response
+            return wait_for_ai_to_finish(self.driver)
+            
+        except Exception as e:
+            print(f"Error sending message: {e}")
+            return ""
 
 def main():
     try:
         # Setup and open browser
         driver = setup_driver()
-        print("Opening browser...")
+        print("Открываем браузер...")
         driver.get(URLS[0])  # Start with ChatGPT
         
-        print("\nAI Chat Console Interface")
-        print("Type 'quit' to exit")
-        print("Type 'switch' to switch between different AI models")
-        print("-" * 50)
+        # Initialize task processor
+        processor = TaskProcessor(driver)
         
-        current_ai_index = 0
+        print("\nСистема обработки задач с использованием ИИ")
+        print("Введите 'quit' для выхода")
+        print("Введите 'history' для просмотра истории")
+        print("-" * 50)
         
         while True:
             # Get user input
-            user_query = input("\nYou: ")
+            task = input("\nВведите задачу: ")
             
-            if user_query.lower() == 'quit':
+            if task.lower() == 'quit':
                 break
                 
-            elif user_query.lower() == 'switch':
-                current_ai_index = (current_ai_index + 1) % len(URLS)
-                print(f"\nSwitching to {URLS[current_ai_index].split('/')[-2]}")
-                driver.get(URLS[current_ai_index])
+            elif task.lower() == 'history':
+                if processor.history:
+                    print("\nИстория обработки:")
+                    for i, record in enumerate(processor.history, 1):
+                        print(f"\nЗадача #{i}:")
+                        print(f"Текст: {record['task']}")
+                        print(f"Тип: {record['classification']['type']}")
+                        print(f"Сложность: {record['complexity']['score']}/10")
+                        if record.get('draft'):
+                            print(f"Черновик: {record['draft'][:100]}...")
+                        print(f"Количество итераций: {len(record['iterations'])}")
+                        if record['iterations']:
+                            print("Использованные модели:", [iter.get('model', 'unknown') for iter in record['iterations']])
+                else:
+                    print("\nИстория обработки пуста")
                 continue
             
-            # Send message and get response
-            print("\nSending message to AI...")
-            response = send_message(driver, user_query)
-            
-            if response:
-                print(f"\nAI: {response}")
-            else:
-                print("\nFailed to get response from AI")
+            # Process the task
+            processor.process_task(task)
             
     except Exception as e:
-        print(f"An error occurred: {e}")
+        print(f"Произошла ошибка: {e}")
     finally:
-        # Keep the browser open until user decides to quit
-        input("\nPress Enter to close the browser...")
+        input("\nНажмите Enter для закрытия браузера...")
         driver.quit()
 
 if __name__ == "__main__":
